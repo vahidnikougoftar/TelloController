@@ -16,6 +16,8 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+from pathlib import Path
+from typing import Any
 
 try:  # Optional dependency for video streaming
     import cv2  # type: ignore
@@ -28,6 +30,7 @@ LOCAL_PORT = 9000
 MOVE_DISTANCE_CM = 50
 NETWORKSETUP_PATH = "/usr/sbin/networksetup" if os.path.exists("/usr/sbin/networksetup") else "networksetup"
 TELLO_STREAM_URL = "udp://@0.0.0.0:11111"
+CONFIG_PATH = Path(__file__).with_name("wifi_config.json")
 
 log_lock = threading.Lock()
 log_lines: list[str] = []
@@ -38,6 +41,34 @@ def append_log(message: str) -> None:
     line = f"[{timestamp}] {message}"
     with log_lock:
         log_lines.append(line)
+
+
+def load_wifi_config() -> dict[str, Any]:
+    if CONFIG_PATH.exists():
+        try:
+            with CONFIG_PATH.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                return data if isinstance(data, dict) else {}
+        except Exception as exc:  # noqa: BLE001
+            append_log(f"wifi_config.json error: {exc}")
+    else:
+        append_log("wifi_config.json not found; using defaults.")
+    return {
+        "interface": "en0",
+        "tello": {"ssid": "TELLO-9A5430", "password": ""},
+        "home": {"ssid": "", "password": ""},
+    }
+
+
+WIFI_CONFIG = load_wifi_config()
+DEFAULT_INTERFACE = str(WIFI_CONFIG.get("interface", "en0"))
+DEFAULT_TELLO_SSID = (
+    WIFI_CONFIG.get("tello", {}).get("ssid") or "TELLO-9A5430"
+)
+DEFAULT_TELLO_PASSWORD = WIFI_CONFIG.get("tello", {}).get("password") or ""
+HOME_WIFI = WIFI_CONFIG.get("home")
+if not isinstance(HOME_WIFI, dict):
+    HOME_WIFI = {}
 
 
 class TelloController:
@@ -188,6 +219,12 @@ class VideoStreamer:
 
 video_streamer = VideoStreamer(controller)
 
+
+def reset_drone_session() -> None:
+    video_streamer.stop()
+    controller.stop()
+    state.set_command_mode(False)
+
 def connect_wifi(interface: str, ssid: str, password: str) -> str:
     if platform.system() != "Darwin":
         raise RuntimeError("Automatic Wi-Fi connection only works on macOS.")
@@ -217,6 +254,16 @@ def connect_wifi(interface: str, ssid: str, password: str) -> str:
     if stderr:
         append_log(stderr)
     return stdout or "Connected"
+
+
+def connect_home_wifi() -> str:
+    ssid = (HOME_WIFI.get("ssid") or "").strip()
+    password = HOME_WIFI.get("password") or ""
+    interface = HOME_WIFI.get("interface") or DEFAULT_INTERFACE
+    if not ssid:
+        raise RuntimeError("Home Wi-Fi SSID missing in wifi_config.json.")
+    append_log(f"Switching {interface} back to home Wi-Fi: {ssid}")
+    return connect_wifi(interface, ssid, password)
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -250,12 +297,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <section>
       <h2>Wi-Fi</h2>
       <label for="interface">Interface (usually en0)</label>
-      <input id="interface" value="en0" />
+      <input id="interface" value="__DEFAULT_INTERFACE__" />
       <label for="ssid">SSID (e.g. TELLO-XXXXXX)</label>
-      <input id="ssid" value="TELLO-9A5430" />
+      <input id="ssid" value="__DEFAULT_TELLO_SSID__" />
       <label for="password">Password (leave empty for stock drones)</label>
-      <input id="password" type="password" />
-      <button id="connectBtn">Connect to Drone</button>
+      <input id="password" type="password" value="__DEFAULT_TELLO_PASSWORD__" />
+      <div>
+        <button id="connectBtn">Connect to Drone</button>
+        <button id="homeBtn" type="button">Return to Home Wi-Fi</button>
+      </div>
     </section>
 
     <section id="video-section">
@@ -274,7 +324,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button data-command="takeoff" class="secondary">Takeoff</button>
         <button data-command="land" class="danger">Land</button>
       </div>
-      <p>Directional buttons send {distance} cm moves.</p>
+      <p>Directional buttons send __MOVE_DISTANCE__ cm moves.</p>
       <div id="movement-grid">
         <div></div>
         <button data-move="forward">Forward</button>
@@ -301,6 +351,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     const videoBtn = document.getElementById('videoBtn');
     const videoFeed = document.getElementById('videoFeed');
     const videoOverlay = document.getElementById('videoOverlay');
+    const homeBtn = document.getElementById('homeBtn');
     let logIndex = 0;
     let videoTimer = null;
 
@@ -322,6 +373,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       };
       refresh();
       videoTimer = setInterval(refresh, 250);
+    }
+
+    function stopVideoLoop() {
+      if (videoTimer) {
+        clearInterval(videoTimer);
+        videoTimer = null;
+      }
+      if (videoFeed) {
+        videoFeed.src = '';
+      }
+      setVideoStatus('Video idle');
+      if (videoBtn) {
+        videoBtn.disabled = false;
+      }
     }
 
     async function postJSON(path, payload) {
@@ -379,6 +444,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       });
     }
 
+    if (homeBtn) {
+      homeBtn.addEventListener('click', async () => {
+        homeBtn.disabled = true;
+        setStatus('Returning to home Wi-Fi...');
+        stopVideoLoop();
+        try {
+          const result = await postJSON('/api/wifi/home', {});
+          setStatus(result.message || 'Home Wi-Fi connected');
+        } catch (err) {
+          setStatus(err.message, true);
+        } finally {
+          homeBtn.disabled = false;
+        }
+      });
+    }
+
     document.querySelectorAll('[data-command]').forEach(btn => {
       btn.addEventListener('click', async () => {
         const command = btn.dataset.command;
@@ -428,7 +509,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </html>
 """
 
-HTML_PAGE = HTML_TEMPLATE.replace("{distance}", str(MOVE_DISTANCE_CM))
+HTML_PAGE = (
+    HTML_TEMPLATE
+    .replace("__MOVE_DISTANCE__", str(MOVE_DISTANCE_CM))
+    .replace("__DEFAULT_INTERFACE__", DEFAULT_INTERFACE)
+    .replace("__DEFAULT_TELLO_SSID__", DEFAULT_TELLO_SSID)
+    .replace("__DEFAULT_TELLO_PASSWORD__", DEFAULT_TELLO_PASSWORD)
+)
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -467,6 +554,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if self.path == "/api/wifi":
             self._handle_wifi(payload)
             return
+        if self.path == "/api/wifi/home":
+            self._handle_wifi_home()
+            return
         if self.path == "/api/command":
             self._handle_command(payload)
             return
@@ -500,6 +590,22 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
         else:
             self._send_json({"ok": True, "message": message})
+
+    def _handle_wifi_home(self) -> None:
+        try:
+            reset_drone_session()
+            message = connect_home_wifi()
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            append_log(f"Home Wi-Fi connect failed: {detail}")
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, detail)
+        except Exception as exc:  # noqa: BLE001
+            append_log(f"Home Wi-Fi connect error: {exc}")
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+        else:
+            self._send_json(
+                {"ok": True, "message": message or "Connected to home Wi-Fi."}
+            )
 
     def _handle_command(self, payload: dict) -> None:
         command = (payload.get("command") or "").strip()

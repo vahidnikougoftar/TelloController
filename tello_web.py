@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""Lightweight web UI for sending commands to a DJI Tello drone."""
+
+import argparse
+import json
+import os
+import platform
+import shlex
+import socket
+import subprocess
+import threading
+from datetime import datetime
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+TELLO_IP = "192.168.10.1"
+TELLO_PORT = 8889
+LOCAL_PORT = 9000
+MOVE_DISTANCE_CM = 50
+NETWORKSETUP_PATH = "/usr/sbin/networksetup" if os.path.exists("/usr/sbin/networksetup") else "networksetup"
+
+log_lock = threading.Lock()
+log_lines: list[str] = []
+
+
+def append_log(message: str) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{timestamp}] {message}"
+    with log_lock:
+        log_lines.append(line)
+
+
+class TelloController:
+    """Minimal UDP interface for the Tello SDK."""
+
+    def __init__(self):
+        self.sock: socket.socket | None = None
+        self.receiver_thread: threading.Thread | None = None
+        self.running = False
+        self.lock = threading.Lock()
+
+    def start(self) -> None:
+        with self.lock:
+            if self.sock:
+                return
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(("", LOCAL_PORT))
+            sock.settimeout(2.0)
+            self.sock = sock
+            self.running = True
+            self.receiver_thread = threading.Thread(target=self._listen, daemon=True)
+            self.receiver_thread.start()
+            append_log("UDP socket ready on port 9000.")
+
+    def stop(self) -> None:
+        with self.lock:
+            self.running = False
+            if self.sock:
+                try:
+                    self.sock.close()
+                finally:
+                    self.sock = None
+            append_log("Socket closed.")
+
+    def _listen(self) -> None:
+        while self.running and self.sock:
+            try:
+                response, _ = self.sock.recvfrom(1024)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            else:
+                decoded = response.decode("utf-8", errors="ignore")
+                append_log(f"<<< {decoded}")
+
+    def send_command(self, command: str) -> bool:
+        self.start()
+        try:
+            assert self.sock is not None
+            self.sock.sendto(command.encode("utf-8"), (TELLO_IP, TELLO_PORT))
+            append_log(f">>> {command}")
+            return True
+        except OSError as exc:
+            append_log(f"Send failed: {exc}")
+            return False
+
+
+controller = TelloController()
+
+
+class AppState:
+    def __init__(self):
+        self._command_mode = False
+        self._lock = threading.Lock()
+
+    def set_command_mode(self, enabled: bool) -> None:
+        with self._lock:
+            self._command_mode = enabled
+
+    def in_command_mode(self) -> bool:
+        with self._lock:
+            return self._command_mode
+
+
+state = AppState()
+
+
+def connect_wifi(interface: str, ssid: str, password: str) -> str:
+    if platform.system() != "Darwin":
+        raise RuntimeError("Automatic Wi-Fi connection only works on macOS.")
+
+    cmd = [NETWORKSETUP_PATH, "-setairportnetwork", interface, ssid]
+    if password:
+        cmd.append(password)
+
+    append_log(f"Connecting {interface} to {ssid}...")
+    if os.geteuid() == 0:
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    else:
+        applescript_cmd = " ".join(shlex.quote(arg) for arg in cmd)
+        script = (
+            'do shell script "{command}" with administrator privileges'.format(
+                command=applescript_cmd.replace("\\", "\\\\").replace('"', '\\"')
+            )
+        )
+        completed = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True, check=True
+        )
+
+    stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+    if stdout:
+        append_log(stdout)
+    if stderr:
+        append_log(stderr)
+    return stdout or "Connected"
+
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Tello Controller</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 0; background: #f5f6f8; }
+    main { max-width: 900px; margin: 0 auto; padding: 24px; }
+    h1 { margin-top: 0; }
+    section { background: #fff; padding: 16px 20px; margin-bottom: 18px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.06); }
+    label { display: block; font-weight: 600; margin-bottom: 4px; }
+    input { width: 100%; padding: 8px; margin-bottom: 12px; border-radius: 6px; border: 1px solid #ccc; font-size: 14px; }
+    button { padding: 10px 18px; border: none; border-radius: 6px; background: #006be6; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; margin-right: 8px; margin-bottom: 8px; }
+    button.secondary { background: #00a86b; }
+    button.danger { background: #d7263d; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    #movement-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 360px; }
+    #log { width: 100%; min-height: 200px; border: 1px solid #ccc; border-radius: 6px; padding: 10px; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 13px; background: #0b1421; color: #e0f3ff; }
+    #status { margin-top: 8px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Tello Controller</h1>
+    <section>
+      <h2>Wi-Fi</h2>
+      <label for="interface">Interface (usually en0)</label>
+      <input id="interface" value="en0" />
+      <label for="ssid">SSID (e.g. TELLO-XXXXXX)</label>
+      <input id="ssid" placeholder="TELLO-123456" />
+      <label for="password">Password (leave empty for stock drones)</label>
+      <input id="password" type="password" />
+      <button id="connectBtn">Connect to Drone</button>
+    </section>
+
+    <section>
+      <h2>Flight Controls</h2>
+      <div>
+        <button data-command="command" class="secondary">Enter Command Mode</button>
+        <button data-command="takeoff" class="secondary">Takeoff</button>
+        <button data-command="land" class="danger">Land</button>
+      </div>
+      <p>Directional buttons send {distance} cm moves.</p>
+      <div id="movement-grid">
+        <div></div>
+        <button data-move="forward">Forward</button>
+        <div></div>
+        <button data-move="left">Left</button>
+        <div></div>
+        <button data-move="right">Right</button>
+        <div></div>
+        <button data-move="back">Backward</button>
+        <div></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Log</h2>
+      <pre id="log"></pre>
+      <div id="status"></div>
+    </section>
+  </main>
+  <script>
+    const connectBtn = document.getElementById('connectBtn');
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    let logIndex = 0;
+
+    function setStatus(message, isError=false) {
+      statusEl.textContent = message;
+      statusEl.style.color = isError ? '#d7263d' : '#006be6';
+    }
+
+    async function postJSON(path, payload) {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {})
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || 'Request failed');
+      }
+      return res.json();
+    }
+
+    connectBtn.addEventListener('click', async () => {
+      const iface = document.getElementById('interface').value.trim() || 'en0';
+      const ssid = document.getElementById('ssid').value.trim();
+      const password = document.getElementById('password').value;
+      if (!ssid) {
+        setStatus('Enter the SSID before connecting.', true);
+        return;
+      }
+      connectBtn.disabled = true;
+      setStatus('Connecting...');
+      try {
+        const result = await postJSON('/api/wifi', { interface: iface, ssid, password });
+        setStatus(result.message || 'Connected');
+      } catch (err) {
+        setStatus(err.message, true);
+      } finally {
+        connectBtn.disabled = false;
+      }
+    });
+
+    document.querySelectorAll('[data-command]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const command = btn.dataset.command;
+        setStatus(`Sending ${command}...`);
+        try {
+          const result = await postJSON('/api/command', { command });
+          setStatus(result.message || 'Sent');
+        } catch (err) {
+          setStatus(err.message, true);
+        }
+      });
+    });
+
+    document.querySelectorAll('[data-move]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const direction = btn.dataset.move;
+        setStatus(`Sending ${direction}...`);
+        try {
+          const result = await postJSON('/api/move', { direction });
+          setStatus(result.message || 'Sent');
+        } catch (err) {
+          setStatus(err.message, true);
+        }
+      });
+    });
+
+    async function pollLogs() {
+      try {
+        const res = await fetch(`/api/logs?from=${logIndex}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.lines && data.lines.length) {
+          logEl.textContent += data.lines.join('\n') + '\n';
+          logEl.scrollTop = logEl.scrollHeight;
+        }
+        logIndex = data.next;
+      } catch (_) {
+        // ignore
+      } finally {
+        setTimeout(pollLogs, 1000);
+      }
+    }
+
+    pollLogs();
+  </script>
+</body>
+</html>
+"""
+
+HTML_PAGE = HTML_TEMPLATE.replace("{distance}", str(MOVE_DISTANCE_CM))
+
+
+class RequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802 (framework method name)
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/index.html"):
+            self._send_response(HTTPStatus.OK, HTML_PAGE, "text/html; charset=utf-8")
+            return
+        if parsed.path == "/api/logs":
+            query = parse_qs(parsed.query or "")
+            start = int(query.get("from", ["0"])[0])
+            with log_lock:
+                lines = log_lines[start:]
+                next_index = start + len(lines)
+            payload = json.dumps({"lines": lines, "next": next_index})
+            self._send_response(HTTPStatus.OK, payload, "application/json")
+            return
+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def do_POST(self):  # noqa: N802
+        content_length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(content_length) if content_length else b""
+        try:
+            payload = json.loads(body or b"{}")
+        except json.JSONDecodeError:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON")
+            return
+
+        if self.path == "/api/wifi":
+            self._handle_wifi(payload)
+            return
+        if self.path == "/api/command":
+            self._handle_command(payload)
+            return
+        if self.path == "/api/move":
+            self._handle_move(payload)
+            return
+        self.send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+
+    def log_message(self, format: str, *args):  # noqa: D401
+        """Silence default stdout logging; we use the UI log instead."""
+        return
+
+    def _handle_wifi(self, payload: dict) -> None:
+        interface = (payload.get("interface") or "en0").strip()
+        ssid = (payload.get("ssid") or "").strip()
+        password = payload.get("password") or ""
+        if not ssid:
+            self.send_error(HTTPStatus.BAD_REQUEST, "SSID required")
+            return
+        try:
+            message = connect_wifi(interface, ssid, password)
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            append_log(f"Wi-Fi connect failed: {detail}")
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, detail)
+        except Exception as exc:  # noqa: BLE001
+            append_log(f"Wi-Fi connect error: {exc}")
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+        else:
+            self._send_json({"ok": True, "message": message})
+
+    def _handle_command(self, payload: dict) -> None:
+        command = (payload.get("command") or "").strip()
+        if not command:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Command required")
+            return
+        if command != "command" and not state.in_command_mode():
+            self.send_error(HTTPStatus.BAD_REQUEST, "Enter command mode first.")
+            return
+        success = controller.send_command(command)
+        if success and command == "command":
+            state.set_command_mode(True)
+        if success:
+            self._send_json({"ok": True, "message": "Command sent."})
+        else:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Send failed.")
+
+    def _handle_move(self, payload: dict) -> None:
+        direction = (payload.get("direction") or "").strip()
+        if direction not in {"left", "right", "forward", "back"}:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid direction")
+            return
+        if not state.in_command_mode():
+            self.send_error(HTTPStatus.BAD_REQUEST, "Enter command mode first.")
+            return
+        command = f"{direction} {MOVE_DISTANCE_CM}"
+        if controller.send_command(command):
+            self._send_json({"ok": True, "message": f"{direction.title()} sent."})
+        else:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Send failed.")
+
+    def _send_response(self, status: HTTPStatus, body: str, content_type: str) -> None:
+        encoded = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_json(self, payload: dict) -> None:
+        body = json.dumps(payload)
+        self._send_response(HTTPStatus.OK, body, "application/json")
+
+
+def run_server(host: str, port: int) -> None:
+    server = ThreadingHTTPServer((host, port), RequestHandler)
+    append_log(f"Web UI available at http://{host}:{port}")
+    print(f"Tello web UI running at http://{host}:{port} (Ctrl+C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        append_log("Shutting down web server...")
+        print("\nStopping server...")
+    finally:
+        controller.stop()
+        server.server_close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="DJI Tello web controller")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8765, help="Listen port (default: 8765)")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    run_server(args.host, args.port)
+
+
+if __name__ == "__main__":
+    main()

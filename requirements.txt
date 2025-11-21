@@ -1,1 +1,3 @@
-# No external pip dependencies; Tkinter ships with the system Python
+# Web UI only uses the standard library for HTTP + Tk fallback
+# Install OpenCV to enable video streaming from the drone
+opencv-python>=4.9.0.0

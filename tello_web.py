@@ -9,16 +9,23 @@ import shlex
 import socket
 import subprocess
 import threading
+import time
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+try:  # Optional dependency for video streaming
+    import cv2  # type: ignore
+except ImportError:  # pragma: no cover
+    cv2 = None
 
 TELLO_IP = "192.168.10.1"
 TELLO_PORT = 8889
 LOCAL_PORT = 9000
 MOVE_DISTANCE_CM = 50
 NETWORKSETUP_PATH = "/usr/sbin/networksetup" if os.path.exists("/usr/sbin/networksetup") else "networksetup"
+TELLO_STREAM_URL = "udp://@0.0.0.0:11111"
 
 log_lock = threading.Lock()
 log_lines: list[str] = []
@@ -87,9 +94,6 @@ class TelloController:
             return False
 
 
-controller = TelloController()
-
-
 class AppState:
     def __init__(self):
         self._command_mode = False
@@ -104,8 +108,83 @@ class AppState:
             return self._command_mode
 
 
+controller = TelloController()
 state = AppState()
 
+
+class VideoStreamer:
+    """Handles pulling frames from the Tello UDP stream via OpenCV."""
+
+    def __init__(self, controller: TelloController):
+        self.controller = controller
+        self.running = False
+        self.thread: threading.Thread | None = None
+        self.frame_lock = threading.Lock()
+        self.latest_frame: bytes | None = None
+        self.stream_enabled = False
+
+    def start(self) -> tuple[bool, str]:
+        if cv2 is None:
+            append_log("OpenCV not installed. Video disabled.")
+            return False, "Install opencv-python to enable video streaming."
+        if not state.in_command_mode():
+            append_log("Video requested before command mode.")
+            return False, "Enter command mode before starting the video stream."
+
+        if not self.stream_enabled:
+            if not self.controller.send_command("streamon"):
+                append_log("Failed to send streamon command.")
+                return False, "Drone rejected the streamon command."
+            self.stream_enabled = True
+            append_log("Drone video stream enabled.")
+
+        if self.running:
+            return True, "Video stream already running."
+
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+        return True, "Video stream starting."
+
+    def _capture_loop(self) -> None:
+        append_log("Connecting to Tello video feed...")
+        cap = cv2.VideoCapture(TELLO_STREAM_URL) if cv2 else None
+        if not cap or not cap.isOpened():
+            append_log("Unable to open the video stream. Check OpenCV/FFmpeg support.")
+            self.running = False
+            self.stream_enabled = False
+            return
+
+        while self.running:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.05)
+                continue
+            ret, buffer = cv2.imencode(".jpg", frame)
+            if ret:
+                with self.frame_lock:
+                    self.latest_frame = buffer.tobytes()
+            else:
+                time.sleep(0.01)
+
+        cap.release()
+
+    def get_frame(self) -> bytes | None:
+        with self.frame_lock:
+            return self.latest_frame
+
+    def stop(self) -> None:
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1)
+        if self.stream_enabled:
+            try:
+                self.controller.send_command("streamoff")
+            finally:
+                self.stream_enabled = False
+
+
+video_streamer = VideoStreamer(controller)
 
 def connect_wifi(interface: str, ssid: str, password: str) -> str:
     if platform.system() != "Darwin":
@@ -145,7 +224,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <title>Tello Controller</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 0; background: #f5f6f8; }
-    main { max-width: 900px; margin: 0 auto; padding: 24px; }
+    main { max-width: 960px; margin: 0 auto; padding: 24px; }
     h1 { margin-top: 0; }
     section { background: #fff; padding: 16px 20px; margin-bottom: 18px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.06); }
     label { display: block; font-weight: 600; margin-bottom: 4px; }
@@ -157,6 +236,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     #movement-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 360px; }
     #log { width: 100%; min-height: 200px; border: 1px solid #ccc; border-radius: 6px; padding: 10px; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 13px; background: #0b1421; color: #e0f3ff; }
     #status { margin-top: 8px; font-weight: 600; }
+    #video-section { text-align: center; }
+    .video-wrapper { position: relative; border-radius: 12px; overflow: hidden; background: #020b16; min-height: 260px; }
+    #videoFeed { width: 100%; min-height: 260px; display: block; object-fit: cover; background: #020b16; }
+    #videoOverlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #e0f3ff; font-weight: 600; text-shadow: 0 0 10px rgba(0,0,0,0.7); pointer-events: none; }
   </style>
 </head>
 <body>
@@ -171,6 +254,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <label for="password">Password (leave empty for stock drones)</label>
       <input id="password" type="password" />
       <button id="connectBtn">Connect to Drone</button>
+    </section>
+
+    <section id="video-section">
+      <h2>Live Camera</h2>
+      <div class="video-wrapper">
+        <img id="videoFeed" alt="Tello video feed" />
+        <div id="videoOverlay">Video idle</div>
+      </div>
+      <button id="videoBtn" class="secondary">Start Video Stream</button>
     </section>
 
     <section>
@@ -204,11 +296,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     const connectBtn = document.getElementById('connectBtn');
     const statusEl = document.getElementById('status');
     const logEl = document.getElementById('log');
+    const videoBtn = document.getElementById('videoBtn');
+    const videoFeed = document.getElementById('videoFeed');
+    const videoOverlay = document.getElementById('videoOverlay');
     let logIndex = 0;
+    let videoTimer = null;
 
     function setStatus(message, isError=false) {
       statusEl.textContent = message;
       statusEl.style.color = isError ? '#d7263d' : '#006be6';
+    }
+
+    function setVideoStatus(message, isError=false) {
+      if (!videoOverlay) return;
+      videoOverlay.textContent = message;
+      videoOverlay.style.color = isError ? '#ff9b9b' : '#e0f3ff';
+    }
+
+    function startVideoLoop() {
+      if (!videoFeed || videoTimer) return;
+      const refresh = () => {
+        videoFeed.src = `/video.jpg?ts=${Date.now()}`;
+      };
+      refresh();
+      videoTimer = setInterval(refresh, 250);
     }
 
     async function postJSON(path, payload) {
@@ -222,6 +333,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         throw new Error(msg || 'Request failed');
       }
       return res.json();
+    }
+
+    if (videoFeed) {
+      videoFeed.addEventListener('load', () => setVideoStatus('Streaming'));
+      videoFeed.addEventListener('error', () => setVideoStatus('Waiting for frames...', true));
     }
 
     connectBtn.addEventListener('click', async () => {
@@ -243,6 +359,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         connectBtn.disabled = false;
       }
     });
+
+    if (videoBtn) {
+      videoBtn.addEventListener('click', async () => {
+        setVideoStatus('Starting video...');
+        videoBtn.disabled = true;
+        try {
+          const result = await postJSON('/api/video/start', {});
+          setStatus(result.message || 'Video starting');
+          setVideoStatus(result.message || 'Connecting...');
+          startVideoLoop();
+        } catch (err) {
+          setStatus(err.message, true);
+          setVideoStatus(err.message, true);
+          videoBtn.disabled = false;
+        }
+      });
+    }
 
     document.querySelectorAll('[data-command]').forEach(btn => {
       btn.addEventListener('click', async () => {
@@ -311,6 +444,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             payload = json.dumps({"lines": lines, "next": next_index})
             self._send_response(HTTPStatus.OK, payload, "application/json")
             return
+        if parsed.path == "/video.jpg":
+            frame = video_streamer.get_frame()
+            if frame:
+                self._send_response(HTTPStatus.OK, frame, "image/jpeg")
+            else:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "Video not ready")
+            return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def do_POST(self):  # noqa: N802
@@ -330,6 +470,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/move":
             self._handle_move(payload)
+            return
+        if self.path == "/api/video/start":
+            self._handle_video_start()
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Unknown endpoint")
 
@@ -386,8 +529,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Send failed.")
 
-    def _send_response(self, status: HTTPStatus, body: str, content_type: str) -> None:
-        encoded = body.encode("utf-8")
+    def _handle_video_start(self) -> None:
+        ok, message = video_streamer.start()
+        if ok:
+            self._send_json({"ok": True, "message": message})
+        else:
+            self.send_error(HTTPStatus.BAD_REQUEST, message)
+
+    def _send_response(self, status: HTTPStatus, body, content_type: str) -> None:
+        encoded = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
@@ -409,6 +559,7 @@ def run_server(host: str, port: int) -> None:
         append_log("Shutting down web server...")
         print("\nStopping server...")
     finally:
+        video_streamer.stop()
         controller.stop()
         server.server_close()
 

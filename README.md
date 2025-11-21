@@ -28,5 +28,5 @@ Then open `http://127.0.0.1:8765` in your browser.
 
 ## Notes
 - UDP commands are sent on port 8889 and the listener socket binds to local port 9000; adjust `TELLO_PORT`/`LOCAL_PORT` in the Python scripts if they conflict with something else.
-- Movement distance defaults to 50 cm; edit `MOVE_DISTANCE_CM` in `tello_web.py` (and `tello_ui.py` if you keep using Tk) to change it.
-- The legacy Tkinter app (`tello_ui.py`) still exists, but Apple's newer Python builds require macOS 12+ for Tk. On older releases you'll see the `macOS 26 (2601) or later required` crash, so stick with the browser UI unless you're on a newer OS.
+- Movement distance defaults to 50 cm; edit `MOVE_DISTANCE_CM` in `tello_web.py` to change it.
+

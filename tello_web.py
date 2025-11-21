@@ -167,7 +167,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <label for="interface">Interface (usually en0)</label>
       <input id="interface" value="en0" />
       <label for="ssid">SSID (e.g. TELLO-XXXXXX)</label>
-      <input id="ssid" placeholder="TELLO-123456" />
+      <input id="ssid" value="TELLO-9A5430" />
       <label for="password">Password (leave empty for stock drones)</label>
       <input id="password" type="password" />
       <button id="connectBtn">Connect to Drone</button>

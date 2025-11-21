@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """Lightweight web UI for sending commands to a DJI Tello drone."""
 
 import argparse

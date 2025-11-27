@@ -283,7 +283,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     button.danger { background: #d7263d; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
     #movement-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-width: 360px; }
-    #log { width: 100%; min-height: 200px; border: 1px solid #ccc; border-radius: 6px; padding: 10px; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 13px; background: #0b1421; color: #e0f3ff; }
+    #log { width: 100%; height: 220px; border: 1px solid #ccc; border-radius: 6px; padding: 10px; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 13px; background: #0b1421; color: #e0f3ff; overflow-y: auto; }
     #status { margin-top: 8px; font-weight: 600; }
     #video-section { text-align: center; }
     .video-wrapper { position: relative; border-radius: 12px; overflow: hidden; background: #020b16; min-height: 260px; }

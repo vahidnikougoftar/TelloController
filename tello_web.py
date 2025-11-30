@@ -225,6 +225,17 @@ def reset_drone_session() -> None:
     controller.stop()
     state.set_command_mode(False)
 
+
+def ensure_command_mode() -> tuple[bool, str]:
+    if state.in_command_mode():
+        return True, "Command mode already active."
+    if controller.send_command("command"):
+        state.set_command_mode(True)
+        append_log("Command mode engaged.")
+        return True, "Command mode engaged."
+    append_log("Failed to engage command mode.")
+    return False, "Unable to enter command mode."
+
 def connect_wifi(interface: str, ssid: str, password: str) -> str:
     if platform.system() != "Darwin":
         raise RuntimeError("Automatic Wi-Fi connection only works on macOS.")
@@ -320,7 +331,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <section>
       <h2>Flight Controls</h2>
       <div>
-        <button data-command="command" class="secondary">Enter Command Mode</button>
         <button data-command="takeoff" class="secondary">Takeoff</button>
         <button data-command="land" class="danger">Land</button>
       </div>
@@ -581,6 +591,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         try:
             message = connect_wifi(interface, ssid, password)
+            time.sleep(0.5)
+            cmd_ok, cmd_msg = ensure_command_mode()
         except subprocess.CalledProcessError as exc:
             detail = exc.stderr.strip() or exc.stdout.strip() or str(exc)
             append_log(f"Wi-Fi connect failed: {detail}")
@@ -589,7 +601,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             append_log(f"Wi-Fi connect error: {exc}")
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
         else:
-            self._send_json({"ok": True, "message": message})
+            combined = message
+            if cmd_ok:
+                combined = f"{message} ({cmd_msg})"
+            self._send_json({"ok": True, "message": combined})
 
     def _handle_wifi_home(self) -> None:
         try:
@@ -612,12 +627,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not command:
             self.send_error(HTTPStatus.BAD_REQUEST, "Command required")
             return
-        if command != "command" and not state.in_command_mode():
+        if command == "command":
+            ok, message = ensure_command_mode()
+            if ok:
+                self._send_json({"ok": True, "message": message})
+            else:
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, message)
+            return
+        if not state.in_command_mode():
             self.send_error(HTTPStatus.BAD_REQUEST, "Enter command mode first.")
             return
         success = controller.send_command(command)
-        if success and command == "command":
-            state.set_command_mode(True)
         if success:
             self._send_json({"ok": True, "message": "Command sent."})
         else:

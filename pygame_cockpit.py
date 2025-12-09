@@ -27,7 +27,7 @@ import pygame
 from djitellopy import tello
 
 # Display layout
-WINDOW_WIDTH, WINDOW_HEIGHT = 800, 600
+WINDOW_WIDTH, WINDOW_HEIGHT = 800, 630
 VIDEO_SIZE = (600, 400)
 PADDING = 24
 BUTTON_W, BUTTON_H = 110, 54

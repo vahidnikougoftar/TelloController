@@ -26,8 +26,8 @@ from djitellopy import tello
 import key_press_module as kp
 
 # Display layout
-WINDOW_WIDTH, WINDOW_HEIGHT = 1000, 750
-VIDEO_SIZE = (880, 500)
+WINDOW_WIDTH, WINDOW_HEIGHT = 800, 600
+VIDEO_SIZE = (600, 400)
 PADDING = 24
 BUTTON_W, BUTTON_H = 110, 54
 BG_COLOR = (16, 18, 24)

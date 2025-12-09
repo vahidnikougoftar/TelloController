@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none" stroke="#E6E9F0" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M64 108V28" />
+  <path d="M38 54l26-26 26 26" />
+  <text x="64" y="120" font-size="24" text-anchor="middle" fill="#E6E9F0" font-family="Arial, sans-serif">W</text>
+</svg>

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none" stroke="#E6E9F0" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M30 100h68" />
+  <path d="M64 92V28" />
+  <path d="M90 68L64 94 38 68" />
+  <text x="64" y="122" font-size="18" text-anchor="middle" fill="#E6E9F0" font-family="Arial, sans-serif">Q</text>
+</svg>

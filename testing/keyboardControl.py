@@ -1,8 +1,15 @@
+from pathlib import Path
+import sys
 from djitellopy import tello
 from time import sleep
-import key_press_module as kp
-import cv2 
+import cv2
 from datetime import datetime as dt
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
+
+import key_press_module as kp  # noqa: E402
 global img 
 
 kp.init()

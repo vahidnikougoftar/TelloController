@@ -1,31 +1,30 @@
-"""Minimalist pygame cockpit UI for driving the Tello with keyboard or on-screen buttons.
+"""Pygame cockpit UI for controlling a DJI Tello with keyboard or on-screen buttons.
 
-This script reuses the project's key_press_module for pygame setup and mirrors the
-keyboard mappings from keyboardControl.py:
-  - Arrow keys: left/right/forward/back
-  - W/S: up/down
-  - A/D: yaw left/right
-  - E: takeoff
-  - Q: land
-  - X: exit the app
+Controls mirror common flight mappings:
+- Arrow keys: left/right/forward/back
+- W/S: up/down
+- A/D: yaw left/right
+- E: takeoff
+- Q: land
+- X: exit the app
 
-It embeds the Tello video feed into the UI and highlights any control that is active
-from either keyboard input or mouse clicks on the on-screen buttons.
+The UI embeds the Tello video feed, highlights active controls (keyboard or mouse),
+and supports a `--debug` flag to iterate without a connected drone.
 """
 
 from __future__ import annotations
 
-import sys
 import argparse
+import logging
+import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
 import pygame
 from djitellopy import tello
-
-import key_press_module as kp
 
 # Display layout
 WINDOW_WIDTH, WINDOW_HEIGHT = 800, 600
@@ -50,6 +49,108 @@ LETTER_LABELS = {
     pygame.K_q: "Q",
     pygame.K_x: "X",
 }
+FPS = 30
+RC_SPEED = 50
+
+
+@dataclass(frozen=True)
+class Layout:
+    """UI sizing and spacing configuration."""
+
+    window_width: int = WINDOW_WIDTH
+    window_height: int = WINDOW_HEIGHT
+    video_size: tuple[int, int] = VIDEO_SIZE
+    padding: int = PADDING
+    button_w: int = BUTTON_W
+    button_h: int = BUTTON_H
+    button_gap: int = BUTTON_GAP
+
+
+@dataclass
+class DroneClient:
+    """Wrapper around djitellopy for resilient usage and debug bypass."""
+
+    debug: bool
+    drone: Optional[tello.Tello] = None
+    frame_reader: Optional[Any] = None
+    status: str = "Not connected."
+    battery: Optional[int] = None
+
+    def connect(self) -> str:
+        if self.debug:
+            self.status = "Debug mode: drone connection skipped."
+            logging.info(self.status)
+            return self.status
+        try:
+            self.drone = tello.Tello()
+            self.drone.connect()
+            self.drone.streamon()
+            self.frame_reader = self.drone.get_frame_read()
+            self.battery = self.drone.get_battery()
+            self.status = f"Connected (battery: {self.battery}%)"
+            logging.info(self.status)
+        except Exception as exc:  # noqa: BLE001
+            self.drone = None
+            self.frame_reader = None
+            self.status = f"Drone unavailable: {exc}"
+            logging.error(self.status)
+        return self.status
+
+    def read_frame(self) -> Optional[np.ndarray]:
+        if self.debug or not self.frame_reader:
+            return None
+        try:
+            return self.frame_reader.frame  # type: ignore[no-any-return]
+        except Exception:
+            return None
+
+    def send_rc_control(self, lr: int, fb: int, ud: int, yv: int) -> None:
+        if self.debug or not self.drone:
+            return
+        try:
+            self.drone.send_rc_control(lr, fb, ud, yv)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("RC control unavailable: %s", exc)
+            self.status = "RC control unavailable; check connection."
+
+    def takeoff(self) -> None:
+        if self.debug or not self.drone:
+            return
+        try:
+            self.drone.takeoff()
+        except Exception as exc:  # noqa: BLE001
+            logging.error("Takeoff failed: %s", exc)
+
+    def land(self) -> None:
+        if self.debug or not self.drone:
+            return
+        try:
+            self.drone.land()
+        except Exception as exc:  # noqa: BLE001
+            logging.error("Landing failed: %s", exc)
+
+    def shutdown(self) -> None:
+        if not self.drone:
+            return
+        try:
+            self.drone.send_rc_control(0, 0, 0, 0)
+            self.drone.streamoff()
+        except Exception as exc:  # noqa: BLE001
+            logging.error("Error during shutdown: %s", exc)
+
+    def refresh_battery(self) -> None:
+        """Update cached battery level if possible."""
+        if self.debug or not self.drone:
+            return
+        try:
+            self.battery = self.drone.get_battery()
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Battery read failed: %s", exc)
+
+    def battery_label(self) -> str:
+        if self.battery is None:
+            return "N/A" if self.debug else "?"
+        return f"{self.battery}%"
 
 
 def load_icon_surface(icon_name: Optional[str], rect: pygame.Rect) -> Optional[pygame.Surface]:
@@ -59,7 +160,8 @@ def load_icon_surface(icon_name: Optional[str], rect: pygame.Rect) -> Optional[p
     icon_path = ICON_DIR / icon_name
     try:
         surface = pygame.image.load(str(icon_path)).convert_alpha()
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to load icon %s: %s", icon_path, exc)
         return None
 
     max_w = rect.width - 14
@@ -71,11 +173,14 @@ def load_icon_surface(icon_name: Optional[str], rect: pygame.Rect) -> Optional[p
     new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
     try:
         return pygame.transform.smoothscale(surface, new_size)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to scale icon %s: %s", icon_path, exc)
         return None
 
 
 class Button:
+    """Interactive UI button mapping to keyboard key and drone control vector."""
+
     def __init__(
         self,
         label: str,
@@ -109,79 +214,64 @@ class Button:
             self.on_tap()
 
 
-def connect_drone(debug: bool = False) -> tuple[Optional[tello.Tello], str]:
-    """Connect to the drone and start the video stream."""
-    if debug:
-        return None, "Debug mode: drone connection skipped."
-    try:
-        drone = tello.Tello()
-        drone.connect()
-        drone.streamon()
-        return drone, f"Connected (battery: {drone.get_battery()}%)"
-    except Exception as exc:  # noqa: BLE001
-        return None, f"Drone unavailable: {exc}"
-
-
-def build_buttons(drone: Optional[tello.Tello], stop_callback: Callable[[], None]) -> list[Button]:
-    """Create button objects with positions and behaviors."""
-    speed = 50
-    bottom_row_y = WINDOW_HEIGHT - PADDING - BUTTON_H
-    top_row_y = bottom_row_y - BUTTON_H - BUTTON_GAP
+def build_buttons(layout: Layout, drone: DroneClient, stop_callback: Callable[[], None]) -> list[Button]:
+    """Create button objects with positions, icons, and behaviors."""
+    bottom_row_y = layout.window_height - layout.padding - layout.button_h
+    top_row_y = bottom_row_y - layout.button_h - layout.button_gap
 
     # WASD cluster on the left (mirrors keyboard arrangement)
-    wasd_left = PADDING
-    wasd_mid = wasd_left + BUTTON_W + BUTTON_GAP
-    wasd_right = wasd_mid + BUTTON_W + BUTTON_GAP
+    wasd_left = layout.padding
+    wasd_mid = wasd_left + layout.button_w + layout.button_gap
+    wasd_right = wasd_mid + layout.button_w + layout.button_gap
 
     # Arrow cluster on the right (mirrors keyboard arrangement)
-    arrow_left = WINDOW_WIDTH - PADDING - (BUTTON_W * 3 + BUTTON_GAP * 2)
-    arrow_mid = arrow_left + BUTTON_W + BUTTON_GAP
-    arrow_right = arrow_mid + BUTTON_W + BUTTON_GAP
+    arrow_left = layout.window_width - layout.padding - (layout.button_w * 3 + layout.button_gap * 2)
+    arrow_mid = arrow_left + layout.button_w + layout.button_gap
+    arrow_right = arrow_mid + layout.button_w + layout.button_gap
 
     # Action buttons stacked to the right of the video frame
-    actions_x = PADDING + VIDEO_SIZE[0] + BUTTON_GAP
-    actions_y = PADDING
+    actions_x = layout.padding + layout.video_size[0] + layout.button_gap
+    actions_y = layout.padding
 
     rows = [
-        ("Up (W)", pygame.K_w, (wasd_mid, top_row_y), (0, 0, speed, 0), "up.svg"),
-        ("Spin CCW (A)", pygame.K_a, (wasd_left, bottom_row_y), (0, 0, 0, -speed), "spin_ccw.svg"),
-        ("Down (S)", pygame.K_s, (wasd_mid, bottom_row_y), (0, 0, -speed, 0), "down.svg"),
-        ("Spin CW (D)", pygame.K_d, (wasd_right, bottom_row_y), (0, 0, 0, speed), "spin_cw.svg"),
-        ("Forward", pygame.K_UP, (arrow_mid, top_row_y), (0, speed, 0, 0), "forward.svg"),
-        ("Left", pygame.K_LEFT, (arrow_left, bottom_row_y), (-speed, 0, 0, 0), "left.svg"),
-        ("Backward", pygame.K_DOWN, (arrow_mid, bottom_row_y), (0, -speed, 0, 0), "backward.svg"),
-        ("Right", pygame.K_RIGHT, (arrow_right, bottom_row_y), (speed, 0, 0, 0), "right.svg"),
-        ("Takeoff (E)", pygame.K_e, (actions_x, actions_y + (BUTTON_H + BUTTON_GAP) * 0), None, "takeoff.svg"),
-        ("Land (Q)", pygame.K_q, (actions_x, actions_y + (BUTTON_H + BUTTON_GAP) * 1), None, "land.svg"),
-        ("Exit (X)", pygame.K_x, (actions_x, actions_y + (BUTTON_H + BUTTON_GAP) * 2), None, "exit.svg"),
+        ("Up (W)", pygame.K_w, (wasd_mid, top_row_y), (0, 0, RC_SPEED, 0), "up.svg"),
+        ("Spin CCW (A)", pygame.K_a, (wasd_left, bottom_row_y), (0, 0, 0, -RC_SPEED), "spin_ccw.svg"),
+        ("Down (S)", pygame.K_s, (wasd_mid, bottom_row_y), (0, 0, -RC_SPEED, 0), "down.svg"),
+        ("Spin CW (D)", pygame.K_d, (wasd_right, bottom_row_y), (0, 0, 0, RC_SPEED), "spin_cw.svg"),
+        ("Forward", pygame.K_UP, (arrow_mid, top_row_y), (0, RC_SPEED, 0, 0), "forward.svg"),
+        ("Left", pygame.K_LEFT, (arrow_left, bottom_row_y), (-RC_SPEED, 0, 0, 0), "left.svg"),
+        ("Backward", pygame.K_DOWN, (arrow_mid, bottom_row_y), (0, -RC_SPEED, 0, 0), "backward.svg"),
+        ("Right", pygame.K_RIGHT, (arrow_right, bottom_row_y), (RC_SPEED, 0, 0, 0), "right.svg"),
+        ("Takeoff (E)", pygame.K_e, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 0), None, "takeoff.svg"),
+        ("Land (Q)", pygame.K_q, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 1), None, "land.svg"),
+        ("Exit (X)", pygame.K_x, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 2), None, "exit.svg"),
     ]
-
-    def takeoff() -> None:
-        if drone:
-            try:
-                drone.takeoff()
-            except Exception:
-                pass
-
-    def land() -> None:
-        if drone:
-            try:
-                drone.land()
-            except Exception:
-                pass
 
     buttons: list[Button] = []
     for label, key, (x, y), control, icon in rows:
-        rect = pygame.Rect(x, y, BUTTON_W - 8, BUTTON_H)
+        rect = pygame.Rect(x, y, layout.button_w - 8, layout.button_h)
         if key == pygame.K_e:
-            buttons.append(Button(label, key, rect, on_tap=takeoff, icon_name=icon))
+            buttons.append(Button(label, key, rect, on_tap=drone.takeoff, icon_name=icon))
         elif key == pygame.K_q:
-            buttons.append(Button(label, key, rect, on_tap=land, icon_name=icon))
+            buttons.append(Button(label, key, rect, on_tap=drone.land, icon_name=icon))
         elif key == pygame.K_x:
             buttons.append(Button(label, key, rect, on_tap=stop_callback, icon_name=icon))
         else:
             buttons.append(Button(label, key, rect, control=control, icon_name=icon))
     return buttons
+
+
+def compute_control_vector(buttons: list[Button], pressed) -> tuple[int, int, int, int]:
+    """Aggregate active button control vectors from keyboard and mouse."""
+    lr = fb = ud = yv = 0
+    for btn in buttons:
+        if btn.is_control and btn.active(pressed):
+            d_lr, d_fb, d_ud, d_yv = btn.control  # type: ignore[misc]
+            lr += d_lr
+            fb += d_fb
+            ud += d_ud
+            yv += d_yv
+    return lr, fb, ud, yv
 
 
 def draw_buttons(
@@ -219,12 +309,13 @@ def draw_buttons(
             screen.blit(label_surface, label_rect)
 
 
-def frame_to_surface(frame) -> Optional[pygame.Surface]:
+def frame_to_surface(frame, video_size: tuple[int, int]) -> Optional[pygame.Surface]:
+    """Convert a cv2 frame to a pygame surface sized to the video viewport."""
     if frame is None:
         return None
     try:
-        rgb = cv2.resize(frame, VIDEO_SIZE)
-        rgb = cv2.flip(rgb,1)
+        rgb = cv2.resize(frame, video_size)
+        rgb = cv2.flip(rgb, 1)
         rotated = np.rot90(rgb)
         return pygame.surfarray.make_surface(rotated)
     except Exception:
@@ -232,43 +323,62 @@ def frame_to_surface(frame) -> Optional[pygame.Surface]:
 
 
 def parse_args() -> argparse.Namespace:
+    """CLI entry point arguments."""
     parser = argparse.ArgumentParser(description="Minimalist Tello pygame cockpit UI")
     parser.add_argument(
         "--debug",
         action="store_true",
         help="Run without connecting to a drone (no RC output or video required)",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity for diagnostics",
+    )
     return parser.parse_args()
+
+
+def setup_logging(level: str) -> None:
+    """Configure root logger output."""
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
 
 
 def main() -> None:
     args = parse_args()
-    kp.init()  # Reuse existing setup; we'll override the window to our custom size next.
-    screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+    setup_logging(args.log_level)
+
+    pygame.init()
+    layout = Layout()
+    screen = pygame.display.set_mode((layout.window_width, layout.window_height))
     pygame.display.set_caption("Tello Cockpit")
-    font = pygame.font.SysFont("Arial", 22)
-    small_font = pygame.font.SysFont("Arial", 16)
+    title_font = pygame.font.SysFont("Arial", 22)
+    text_font = pygame.font.SysFont("Arial", 16)
     label_font = pygame.font.SysFont("Arial", 14)
     clock = pygame.time.Clock()
 
-    drone, status = connect_drone(debug=args.debug)
-    frame_reader = drone.get_frame_read() if drone else None
+    drone = DroneClient(debug=args.debug)
+    status = drone.connect()
     running = True
+    last_battery_poll_ms = 0
 
     def stop_app() -> None:
         nonlocal running
         running = False
 
-    buttons = build_buttons(drone, stop_app)
+    buttons = build_buttons(layout, drone, stop_app)
     video_rect = pygame.Rect(
-        PADDING,
-        PADDING,
-        VIDEO_SIZE[0],
-        VIDEO_SIZE[1],
+        layout.padding,
+        layout.padding,
+        layout.video_size[0],
+        layout.video_size[1],
     )
 
     while running:
-        clock.tick(30)
+        clock.tick(FPS)
         pressed = pygame.key.get_pressed()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -295,45 +405,32 @@ def main() -> None:
                         if btn.key == pygame.K_q and btn.is_action:
                             btn.handle_click()
 
-        # Calculate control vector based on active buttons
-        lr = fb = ud = yv = 0
-        for btn in buttons:
-            if btn.is_control and btn.active(pressed):
-                d_lr, d_fb, d_ud, d_yv = btn.control  # type: ignore[misc]
-                lr += d_lr
-                fb += d_fb
-                ud += d_ud
-                yv += d_yv
+        lr, fb, ud, yv = compute_control_vector(buttons, pressed)
+        drone.send_rc_control(lr, fb, ud, yv)
+        status = drone.status
+        now_ms = pygame.time.get_ticks()
+        if now_ms - last_battery_poll_ms >= 5000:
+            drone.refresh_battery()
+            last_battery_poll_ms = now_ms
 
-        if drone:
-            try:
-                drone.send_rc_control(lr, fb, ud, yv)
-            except Exception:
-                status = "RC control unavailable; check connection."
-
-        # Draw background and video
         screen.fill(BG_COLOR)
         pygame.draw.rect(screen, VIDEO_BG, video_rect, border_radius=12)
-        frame_surface = frame_to_surface(frame_reader.frame if frame_reader else None)
+
+        frame_surface = frame_to_surface(drone.read_frame(), layout.video_size)
         if frame_surface:
             screen.blit(frame_surface, video_rect)
         else:
-            placeholder = small_font.render(status or "Waiting for video...", True, TEXT_COLOR)
+            placeholder = text_font.render(status or "Waiting for video...", True, TEXT_COLOR)
             screen.blit(placeholder, placeholder.get_rect(center=video_rect.center))
 
-        # UI text
-        screen.blit(font.render("Tello Cockpit", True, TEXT_COLOR), (video_rect.left, video_rect.bottom + 12))
-        screen.blit(small_font.render(status, True, TEXT_COLOR), (video_rect.left, video_rect.bottom + 40))
+        title = f"Tello Cockpit ({drone.battery_label()})"
+        screen.blit(title_font.render(title, True, TEXT_COLOR), (video_rect.left, video_rect.bottom + 12))
+        screen.blit(text_font.render(status, True, TEXT_COLOR), (video_rect.left, video_rect.bottom + 40))
 
-        draw_buttons(screen, small_font, label_font, buttons, pressed)
+        draw_buttons(screen, text_font, label_font, buttons, pressed)
         pygame.display.flip()
 
-    if drone:
-        try:
-            drone.send_rc_control(0, 0, 0, 0)
-            drone.streamoff()
-        except Exception:
-            pass
+    drone.shutdown()
     pygame.quit()
 
 
@@ -343,3 +440,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pygame.quit()
         sys.exit()
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Fatal error: %s", exc)
+        pygame.quit()
+        sys.exit(1)

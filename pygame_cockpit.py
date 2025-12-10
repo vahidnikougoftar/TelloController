@@ -50,7 +50,10 @@ LETTER_LABELS = {
     pygame.K_x: "X",
 }
 FPS = 30
-RC_SPEED = 50
+DEFAULT_RC_SPEED = 50
+MIN_RC_SPEED = 10
+MAX_RC_SPEED = 100
+SLIDER_HEIGHT = 15
 
 
 @dataclass(frozen=True)
@@ -234,14 +237,14 @@ def build_buttons(layout: Layout, drone: DroneClient, stop_callback: Callable[[]
     actions_y = layout.padding
 
     rows = [
-        ("Up (W)", pygame.K_w, (wasd_mid, top_row_y), (0, 0, RC_SPEED, 0), "up.svg"),
-        ("Spin CCW (A)", pygame.K_a, (wasd_left, bottom_row_y), (0, 0, 0, -RC_SPEED), "spin_ccw.svg"),
-        ("Down (S)", pygame.K_s, (wasd_mid, bottom_row_y), (0, 0, -RC_SPEED, 0), "down.svg"),
-        ("Spin CW (D)", pygame.K_d, (wasd_right, bottom_row_y), (0, 0, 0, RC_SPEED), "spin_cw.svg"),
-        ("Forward", pygame.K_UP, (arrow_mid, top_row_y), (0, RC_SPEED, 0, 0), "forward.svg"),
-        ("Left", pygame.K_LEFT, (arrow_left, bottom_row_y), (-RC_SPEED, 0, 0, 0), "left.svg"),
-        ("Backward", pygame.K_DOWN, (arrow_mid, bottom_row_y), (0, -RC_SPEED, 0, 0), "backward.svg"),
-        ("Right", pygame.K_RIGHT, (arrow_right, bottom_row_y), (RC_SPEED, 0, 0, 0), "right.svg"),
+        ("Up (W)", pygame.K_w, (wasd_mid, top_row_y), (0, 0, 1, 0), "up.svg"),
+        ("Spin CCW (A)", pygame.K_a, (wasd_left, bottom_row_y), (0, 0, 0, -1), "spin_ccw.svg"),
+        ("Down (S)", pygame.K_s, (wasd_mid, bottom_row_y), (0, 0, -1, 0), "down.svg"),
+        ("Spin CW (D)", pygame.K_d, (wasd_right, bottom_row_y), (0, 0, 0, 1), "spin_cw.svg"),
+        ("Forward", pygame.K_UP, (arrow_mid, top_row_y), (0, 1, 0, 0), "forward.svg"),
+        ("Left", pygame.K_LEFT, (arrow_left, bottom_row_y), (-1, 0, 0, 0), "left.svg"),
+        ("Backward", pygame.K_DOWN, (arrow_mid, bottom_row_y), (0, -1, 0, 0), "backward.svg"),
+        ("Right", pygame.K_RIGHT, (arrow_right, bottom_row_y), (1, 0, 0, 0), "right.svg"),
         ("Takeoff (E)", pygame.K_e, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 0), None, "takeoff.svg"),
         ("Land (Q)", pygame.K_q, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 1), None, "land.svg"),
         ("Exit (X)", pygame.K_x, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 2), None, "exit.svg"),
@@ -261,7 +264,7 @@ def build_buttons(layout: Layout, drone: DroneClient, stop_callback: Callable[[]
     return buttons
 
 
-def compute_control_vector(buttons: list[Button], pressed) -> tuple[int, int, int, int]:
+def compute_control_vector(buttons: list[Button], pressed, speed: int) -> tuple[int, int, int, int]:
     """Aggregate active button control vectors from keyboard and mouse."""
     lr = fb = ud = yv = 0
     for btn in buttons:
@@ -271,7 +274,49 @@ def compute_control_vector(buttons: list[Button], pressed) -> tuple[int, int, in
             fb += d_fb
             ud += d_ud
             yv += d_yv
-    return lr, fb, ud, yv
+    return int(lr * speed), int(fb * speed), int(ud * speed), int(yv * speed)
+
+
+def clamp_speed(value: int) -> int:
+    return max(MIN_RC_SPEED, min(MAX_RC_SPEED, value))
+
+
+def speed_from_position(x: int, rect: pygame.Rect) -> int:
+    """Convert an x coordinate inside the slider to a speed value."""
+    ratio = (x - rect.left) / rect.width
+    ratio = max(0.0, min(1.0, ratio))
+    return int(MIN_RC_SPEED + ratio * (MAX_RC_SPEED - MIN_RC_SPEED))
+
+
+def draw_speed_slider(
+    screen: pygame.Surface,
+    font: pygame.font.Font,
+    label_font: pygame.font.Font,
+    rect: pygame.Rect,
+    speed: int,
+) -> None:
+    """Render the speed slider and current value."""
+    pygame.draw.rect(screen, OUTLINE_COLOR, rect.inflate(0, 6), border_radius=6)
+    fill_ratio = (clamp_speed(speed) - MIN_RC_SPEED) / (MAX_RC_SPEED - MIN_RC_SPEED)
+    fill_width = max(0, int(rect.width * fill_ratio))
+    if fill_width:
+        fill_rect = pygame.Rect(rect.left, rect.top, fill_width, rect.height)
+        pygame.draw.rect(screen, ACTIVE_COLOR, fill_rect, border_radius=6)
+
+    knob = pygame.Rect(0, 0, 12, 16)
+    knob_center_x = rect.left + fill_width
+    knob_center_x = max(
+        rect.left + knob.width // 2,
+        min(rect.right - knob.width // 2, knob_center_x),
+    )
+    knob.center = (knob_center_x, rect.centery)
+    pygame.draw.rect(screen, BUTTON_COLOR, knob, border_radius=4)
+    pygame.draw.rect(screen, OUTLINE_COLOR, knob, width=1, border_radius=4)
+
+    label_surface = label_font.render("Speed", True, TEXT_COLOR)
+    value_surface = font.render(f"{speed}", True, TEXT_COLOR)
+    screen.blit(label_surface, (rect.left, rect.top - 20))
+    screen.blit(value_surface, (rect.right - value_surface.get_width(), rect.top - 20))
 
 
 def draw_buttons(
@@ -364,6 +409,8 @@ def main() -> None:
     status = drone.connect()
     running = True
     last_battery_poll_ms = 0
+    speed_value = DEFAULT_RC_SPEED
+    dragging_speed = False
 
     def stop_app() -> None:
         nonlocal running
@@ -376,6 +423,12 @@ def main() -> None:
         layout.video_size[0],
         layout.video_size[1],
     )
+    slider_rect = pygame.Rect(
+        layout.padding + layout.video_size[0] + layout.button_gap,
+        layout.padding + int((layout.button_h + layout.button_gap) * 3)+10,
+        layout.button_w - 8,
+        SLIDER_HEIGHT,
+    )
 
     while running:
         clock.tick(FPS)
@@ -384,15 +437,24 @@ def main() -> None:
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                for btn in buttons:
-                    if btn.rect.collidepoint(event.pos):
-                        if btn.is_action:
-                            btn.handle_click()
-                        elif btn.is_control:
-                            btn.mouse_active = True
+                if slider_rect.collidepoint(event.pos):
+                    dragging_speed = True
+                    speed_value = speed_from_position(event.pos[0], slider_rect)
+                else:
+                    for btn in buttons:
+                        if btn.rect.collidepoint(event.pos):
+                            if btn.is_action:
+                                btn.handle_click()
+                            elif btn.is_control:
+                                btn.mouse_active = True
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if dragging_speed:
+                    speed_value = speed_from_position(event.pos[0], slider_rect)
+                    dragging_speed = False
                 for btn in buttons:
                     btn.mouse_active = False
+            elif event.type == pygame.MOUSEMOTION and dragging_speed:
+                speed_value = speed_from_position(event.pos[0], slider_rect)
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_x:
                     running = False
@@ -405,7 +467,7 @@ def main() -> None:
                         if btn.key == pygame.K_q and btn.is_action:
                             btn.handle_click()
 
-        lr, fb, ud, yv = compute_control_vector(buttons, pressed)
+        lr, fb, ud, yv = compute_control_vector(buttons, pressed, speed_value)
         drone.send_rc_control(lr, fb, ud, yv)
         status = drone.status
         now_ms = pygame.time.get_ticks()
@@ -427,6 +489,7 @@ def main() -> None:
         screen.blit(title_font.render(title, True, TEXT_COLOR), (video_rect.left, video_rect.bottom + 12))
         screen.blit(text_font.render(status, True, TEXT_COLOR), (video_rect.left, video_rect.bottom + 40))
 
+        draw_speed_slider(screen, text_font, label_font, slider_rect, speed_value)
         draw_buttons(screen, text_font, label_font, buttons, pressed)
         pygame.display.flip()
 

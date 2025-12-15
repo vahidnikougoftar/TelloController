@@ -8,7 +8,6 @@ def init():
 # get key press events
 def get_key_events(keyName):
     ans = False
-    for event in pygame.event.get(): pass
     keyInput = pygame.key.get_pressed()
     myKey = getattr(pygame, f'K_{keyName}')
     if keyInput[myKey]:
@@ -19,4 +18,3 @@ def get_key_events(keyName):
     
 if __name__ == "__main__":
     init()
- 

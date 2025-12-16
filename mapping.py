@@ -532,7 +532,8 @@ def main() -> None:
         # draw the points on the map
 
         for point in points:
-        
+            if drone.debug:
+                print(point)
             cv2.circle(map, point ,2 , (255,255,255),3)
         cv2.circle(map, head ,3 , (0,0,255),5)
         # add a small circle at the ciccumference to indicate the direction

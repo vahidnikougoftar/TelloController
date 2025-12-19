@@ -26,6 +26,8 @@ import numpy as np
 import pygame
 from djitellopy import tello
 
+from vision import FaceDetector, YOLOv8Detector
+
 ##### PARAMETERS  FOR CALIBRATION OF MOVEMENTS #####
 fwdSpeed = 117 / 10.0 # Actual Forward speed in cm/s
 angSpeed = 360 / 10.0 # Actual Angular speed in degrees/s
@@ -364,13 +366,14 @@ def draw_buttons(
             screen.blit(label_surface, label_rect)
 
 
-def frame_to_surface(frame, video_size: tuple[int, int]) -> Optional[pygame.Surface]:
+def frame_to_surface(frame, video_size: tuple[int, int], mirror: bool = False) -> Optional[pygame.Surface]:
     """Convert a cv2 frame to a pygame surface sized to the video viewport."""
     if frame is None:
         return None
     try:
         rgb = cv2.resize(frame, video_size)
-        rgb = cv2.flip(rgb, 1)
+        if mirror:
+            rgb = cv2.flip(rgb, 1)
         rotated = np.rot90(rgb)
         return pygame.surfarray.make_surface(rotated)
     except Exception:
@@ -391,6 +394,28 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity for diagnostics",
     )
+    parser.add_argument(
+        "--vision",
+        choices=["none", "face", "yolo"],
+        default="none",
+        help="Annotate frames with vision modules (face or YOLOv8)",
+    )
+    parser.add_argument(
+        "--yolo-model",
+        default="yolov8m.pt",
+        help="Path to YOLOv8 weights when --vision yolo is enabled",
+    )
+    parser.add_argument(
+        "--vision-device",
+        default="cpu",
+        help="Device for vision models (cpu, cuda, mps)",
+    )
+    parser.add_argument(
+        "--yolo-conf",
+        type=float,
+        default=0.25,
+        help="Confidence threshold for YOLOv8 detections",
+    )
     return parser.parse_args()
 
 
@@ -400,6 +425,22 @@ def setup_logging(level: str) -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
+
+
+def build_vision_module(args: argparse.Namespace):
+    """Instantiate the selected vision module if requested."""
+    try:
+        if args.vision == "face":
+            return FaceDetector()
+        if args.vision == "yolo":
+            return YOLOv8Detector(
+                model_path=Path(args.yolo_model),
+                device=args.vision_device,
+                conf=args.yolo_conf,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logging.error("Vision module failed to initialize (%s): %s", args.vision, exc)
+    return None
 
 
 def main() -> None:
@@ -417,6 +458,8 @@ def main() -> None:
 
     drone = DroneClient(debug=args.debug)
     status = drone.connect()
+    vision_module = build_vision_module(args)
+    vision_mode = args.vision if vision_module else "none"
     running = True
     last_battery_poll_ms = 0
     speed_value = DEFAULT_RC_SPEED
@@ -488,10 +531,17 @@ def main() -> None:
             drone.refresh_battery()
             last_battery_poll_ms = now_ms
 
+        vision_detections = []
+        frame = drone.read_frame()
+        if frame is not None:
+            frame = cv2.flip(frame, 1)
+            if vision_module:
+                frame, vision_detections = vision_module.annotate(frame)
+
         screen.fill(BG_COLOR)
         pygame.draw.rect(screen, VIDEO_BG, video_rect, border_radius=12)
 
-        frame_surface = frame_to_surface(drone.read_frame(), layout.video_size)
+        frame_surface = frame_to_surface(frame, layout.video_size)
         if frame_surface:
             screen.blit(frame_surface, video_rect)
         else:
@@ -501,6 +551,9 @@ def main() -> None:
         title = f"Tello Cockpit ({drone.battery_label()})"
         screen.blit(title_font.render(title, True, TEXT_COLOR), (video_rect.left, video_rect.bottom + 12))
         screen.blit(text_font.render(status, True, TEXT_COLOR), (video_rect.left, video_rect.bottom + 40))
+        if vision_module:
+            vision_label = f"Vision: {vision_mode} ({len(vision_detections)} detections)"
+            screen.blit(text_font.render(vision_label, True, TEXT_COLOR), (video_rect.left, video_rect.bottom + 60))
 
         draw_speed_slider(screen, text_font, label_font, slider_rect, speed_value)
         draw_buttons(screen, text_font, label_font, buttons, pressed)
@@ -533,8 +586,7 @@ def main() -> None:
 
         for point in points:
             if drone.debug:
-                print(point)
-            cv2.circle(map, point ,2 , (255,255,255),3)
+                cv2.circle(map, point ,2 , (255,255,255),3)
         cv2.circle(map, head ,3 , (0,0,255),5)
         # add a small circle at the ciccumference to indicate the direction
         cen = (int(head[0] + 8 * np.cos(np.radians(angle))), int(head[1] + 8 * np.sin(np.radians(angle))))

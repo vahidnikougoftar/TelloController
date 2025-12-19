@@ -534,7 +534,7 @@ def main() -> None:
         vision_detections = []
         frame = drone.read_frame()
         if frame is not None:
-            frame = cv2.flip(frame, 1)
+            # frame = cv2.flip(frame, 1)
             if vision_module:
                 frame, vision_detections = vision_module.annotate(frame)
 
@@ -592,6 +592,7 @@ def main() -> None:
         cen = (int(head[0] + 8 * np.cos(np.radians(angle))), int(head[1] + 8 * np.sin(np.radians(angle))))
         cv2.circle(map,cen,radius=1,color=(0,0,255),thickness=3)
         cv2.putText(map,f"{(head[0]-500,-head[1]+500)}", (head[0]+10,head[1]+10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255),1)
+        
         cv2.imshow("Tello Mapping",map)
         
     drone.shutdown()

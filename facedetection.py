@@ -1,7 +1,5 @@
 import cv2
-
 from vision import FaceDetector
-
 
 def main() -> None:
     cap = cv2.VideoCapture(0)
@@ -21,7 +19,6 @@ def main() -> None:
 
     cap.release()
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""Lightweight web UI for sending commands to a DJI Tello drone."""
+"""Legacy web UI for sending commands to a DJI Tello drone."""
 
 import argparse
 import json
@@ -30,7 +30,7 @@ LOCAL_PORT = 9000
 MOVE_DISTANCE_CM = 50
 NETWORKSETUP_PATH = "/usr/sbin/networksetup" if os.path.exists("/usr/sbin/networksetup") else "networksetup"
 TELLO_STREAM_URL = "udp://@0.0.0.0:11111"
-CONFIG_PATH = Path(__file__).with_name("wifi_config.json")
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "wifi_config.json"
 
 log_lock = threading.Lock()
 log_lines: list[str] = []

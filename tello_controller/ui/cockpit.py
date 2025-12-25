@@ -1,43 +1,21 @@
-"""Pygame cockpit UI for controlling a DJI Tello with keyboard or on-screen buttons.
-
-Controls mirror common flight mappings:
-- Arrow keys: left/right/forward/back
-- W/S: up/down
-- A/D: yaw left/right
-- E: takeoff
-- Q: land
-- X: exit the app
-
-The UI embeds the Tello video feed, highlights active controls (keyboard or mouse),
-and supports a `--debug` flag to iterate without a connected drone.
-"""
+"""Pygame cockpit UI for controlling a DJI Tello with keyboard or on-screen buttons."""
 
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
-from dataclasses import dataclass
+from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
 import pygame
-from djitellopy import tello
 
-from vision import FaceDetector, YOLOv8Detector
-
-##### PARAMETERS  FOR CALIBRATION OF MOVEMENTS #####
-fwdSpeed = 117 / 10.0 # Actual Forward speed in cm/s
-angSpeed = 360 / 10.0 # Actual Angular speed in degrees/s
-
-interval = 0.2  # time interval for each control command in seconds (this is averag time a keyboard press lasts)
-
-distanceInterval = fwdSpeed * interval  # distance covered in each interval
-angleInterval = angSpeed * interval  # angle covered in each interval
-#####################################################
-
+from tello_controller.drone import DroneClient
+from tello_controller.vision import FaceDetector, YOLOv8Detector
 
 # Display layout
 WINDOW_WIDTH, WINDOW_HEIGHT = 800, 630
@@ -52,13 +30,14 @@ BUTTON_COLOR = (48, 54, 68)
 ACTIVE_COLOR = (88, 148, 255)
 HOVER_COLOR = (68, 94, 128)
 OUTLINE_COLOR = (90, 95, 110)
-ICON_DIR = Path(__file__).parent / "icons"
+ICON_DIR = Path(__file__).resolve().parents[1] / "assets" / "icons"
 LETTER_LABELS = {
     pygame.K_w: "W",
     pygame.K_a: "A",
     pygame.K_s: "S",
     pygame.K_d: "D",
     pygame.K_e: "E",
+    pygame.K_p: "P",
     pygame.K_q: "Q",
     pygame.K_x: "X",
 }
@@ -81,116 +60,69 @@ class Layout:
     button_h: int = BUTTON_H
     button_gap: int = BUTTON_GAP
 
+
+@dataclass(frozen=True)
+class Calibration:
+    """Flight calibration values for map tracking."""
+
+    forward_speed_cm_s: float = 117 / 10.0
+    angular_speed_deg_s: float = 360 / 10.0
+    interval_s: float = 0.2
+
+    @property
+    def distance_per_interval(self) -> float:
+        return self.forward_speed_cm_s * self.interval_s
+
+    @property
+    def angle_per_interval(self) -> float:
+        return self.angular_speed_deg_s * self.interval_s
+
+
 @dataclass
-class DroneClient:
-    """Wrapper around djitellopy for resilient usage and debug bypass."""
+class MapTracker:
+    """Simple 2D map tracker for movement visualization."""
 
-    debug: bool
-    drone: Optional[tello.Tello] = None
-    frame_reader: Optional[Any] = None
-    status: str = "Not connected."
-    battery: Optional[int] = None
+    size: tuple[int, int] = (1000, 1000)
+    origin: tuple[int, int] = (500, 500)
+    angle: float = -90.0
+    x: float = 0.0
+    y: float = 0.0
+    points: list[tuple[int, int]] = field(default_factory=lambda: [(500, 500)])
 
-    def connect(self) -> str:
-        if self.debug:
-            self.status = "Debug mode: drone connection skipped."
-            logging.info(self.status)
-            return self.status
-        try:
-            self.drone = tello.Tello()
-            self.drone.connect()
-            self.drone.streamon()
-            self.frame_reader = self.drone.get_frame_read()
-            self.battery = self.drone.get_battery()
-            self.status = f"Connected (battery: {self.battery}%)"
-            logging.info(self.status)
-        except Exception as exc:  # noqa: BLE001
-            self.drone = None
-            self.frame_reader = None
-            self.status = f"Drone unavailable: {exc}"
-            logging.error(self.status)
-        return self.status
+    def update(self, lr: int, fb: int, yv: int, calibration: Calibration) -> None:
+        if fb != 0:
+            self.x += calibration.distance_per_interval * fb / abs(fb) * np.cos(np.radians(self.angle))
+            self.y += calibration.distance_per_interval * fb / abs(fb) * np.sin(np.radians(self.angle))
+        if yv != 0:
+            self.angle = (self.angle + calibration.angle_per_interval * yv / abs(yv)) % 360
+        if lr != 0:
+            self.x += calibration.distance_per_interval * lr / abs(lr) * np.cos(np.radians(self.angle + 90))
+            self.y += calibration.distance_per_interval * lr / abs(lr) * np.sin(np.radians(self.angle + 90))
+        head = (int(self.origin[0] + self.x), int(self.origin[1] + self.y))
+        self.points.append(head)
 
-    def read_frame(self) -> Optional[np.ndarray]:
-        if self.debug or not self.frame_reader:
-            return None
-        try:
-            return self.frame_reader.frame  # type: ignore[no-any-return]
-        except Exception:
-            return None
-
-    def send_rc_control(self, lr: int, fb: int, ud: int, yv: int) -> None:
-        if self.debug or not self.drone:
-            return
-        try:
-            self.drone.send_rc_control(lr, fb, ud, yv)
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("RC control unavailable: %s", exc)
-            self.status = "RC control unavailable; check connection."
-
-    def takeoff(self) -> None:
-        if self.debug or not self.drone:
-            return
-        try:
-            self.drone.takeoff()
-        except Exception as exc:  # noqa: BLE001
-            logging.error("Takeoff failed: %s", exc)
-
-    def land(self) -> None:
-        if self.debug or not self.drone:
-            return
-        try:
-            self.drone.land()
-        except Exception as exc:  # noqa: BLE001
-            logging.error("Landing failed: %s", exc)
-
-    def shutdown(self) -> None:
-        if not self.drone:
-            return
-        try:
-            self.drone.send_rc_control(0, 0, 0, 0)
-            self.drone.streamoff()
-        except Exception as exc:  # noqa: BLE001
-            logging.error("Error during shutdown: %s", exc)
-
-    def refresh_battery(self) -> None:
-        """Update cached battery level if possible."""
-        if self.debug or not self.drone:
-            return
-        try:
-            self.battery = self.drone.get_battery()
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("Battery read failed: %s", exc)
-
-    def battery_label(self) -> str:
-        if self.battery is None:
-            return "N/A" if self.debug else "?"
-        return f"{self.battery}%"
-
-
-def load_icon_surface(icon_name: Optional[str], rect: pygame.Rect) -> Optional[pygame.Surface]:
-    """Load and scale an icon SVG/bitmap to fit the button rect."""
-    if not icon_name:
-        return None
-    icon_path = ICON_DIR / icon_name
-    try:
-        surface = pygame.image.load(str(icon_path)).convert_alpha()
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Failed to load icon %s: %s", icon_path, exc)
-        return None
-
-    max_w = rect.width - 14
-    max_h = rect.height - 14
-    w, h = surface.get_size()
-    if w == 0 or h == 0 or max_w <= 0 or max_h <= 0:
-        return None
-    scale = min(max_w / w, max_h / h, 1)
-    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
-    try:
-        return pygame.transform.smoothscale(surface, new_size)
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Failed to scale icon %s: %s", icon_path, exc)
-        return None
+    def render(self, draw_path: bool) -> np.ndarray:
+        canvas = np.zeros((self.size[1], self.size[0], 3), dtype=np.uint8)
+        head = self.points[-1]
+        if draw_path:
+            for point in self.points:
+                cv2.circle(canvas, point, 2, (255, 255, 255), 3)
+        cv2.circle(canvas, head, 3, (0, 0, 255), 5)
+        indicator = (
+            int(head[0] + 8 * np.cos(np.radians(self.angle))),
+            int(head[1] + 8 * np.sin(np.radians(self.angle))),
+        )
+        cv2.circle(canvas, indicator, radius=1, color=(0, 0, 255), thickness=3)
+        cv2.putText(
+            canvas,
+            f"{(head[0] - self.origin[0], -head[1] + self.origin[1])}",
+            (head[0] + 10, head[1] + 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 255),
+            1,
+        )
+        return canvas
 
 
 class Button:
@@ -229,7 +161,37 @@ class Button:
             self.on_tap()
 
 
-def build_buttons(layout: Layout, drone: DroneClient, stop_callback: Callable[[], None]) -> list[Button]:
+def load_icon_surface(icon_name: Optional[str], rect: pygame.Rect) -> Optional[pygame.Surface]:
+    """Load and scale an icon SVG/bitmap to fit the button rect."""
+    if not icon_name:
+        return None
+    icon_path = ICON_DIR / icon_name
+    try:
+        surface = pygame.image.load(str(icon_path)).convert_alpha()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to load icon %s: %s", icon_path, exc)
+        return None
+
+    max_w = rect.width - 14
+    max_h = rect.height - 14
+    w, h = surface.get_size()
+    if w == 0 or h == 0 or max_w <= 0 or max_h <= 0:
+        return None
+    scale = min(max_w / w, max_h / h, 1)
+    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    try:
+        return pygame.transform.smoothscale(surface, new_size)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to scale icon %s: %s", icon_path, exc)
+        return None
+
+
+def build_buttons(
+    layout: Layout,
+    drone: DroneClient,
+    stop_callback: Callable[[], None],
+    snapshot_callback: Callable[[], None],
+) -> list[Button]:
     """Create button objects with positions, icons, and behaviors."""
     bottom_row_y = layout.window_height - layout.padding - layout.button_h
     top_row_y = bottom_row_y - layout.button_h - layout.button_gap
@@ -259,7 +221,8 @@ def build_buttons(layout: Layout, drone: DroneClient, stop_callback: Callable[[]
         ("Right", pygame.K_RIGHT, (arrow_right, bottom_row_y), (1, 0, 0, 0), "right.svg"),
         ("Takeoff (E)", pygame.K_e, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 0), None, "takeoff.svg"),
         ("Land (Q)", pygame.K_q, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 1), None, "land.svg"),
-        ("Exit (X)", pygame.K_x, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 2), None, "exit.svg"),
+        ("Snapshot (P)", pygame.K_p, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 2), None, None),
+        ("Exit (X)", pygame.K_x, (actions_x, actions_y + (layout.button_h + layout.button_gap) * 3), None, "exit.svg"),
     ]
 
     buttons: list[Button] = []
@@ -269,6 +232,8 @@ def build_buttons(layout: Layout, drone: DroneClient, stop_callback: Callable[[]
             buttons.append(Button(label, key, rect, on_tap=drone.takeoff, icon_name=icon))
         elif key == pygame.K_q:
             buttons.append(Button(label, key, rect, on_tap=drone.land, icon_name=icon))
+        elif key == pygame.K_p:
+            buttons.append(Button(label, key, rect, on_tap=snapshot_callback, icon_name=icon))
         elif key == pygame.K_x:
             buttons.append(Button(label, key, rect, on_tap=stop_callback, icon_name=icon))
         else:
@@ -402,7 +367,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--yolo-model",
-        default="yolov8m.pt",
+        default=str(Path(__file__).resolve().parents[1] / "assets" / "yolov8m.pt"),
         help="Path to YOLOv8 weights when --vision yolo is enabled",
     )
     parser.add_argument(
@@ -464,12 +429,27 @@ def main() -> None:
     last_battery_poll_ms = 0
     speed_value = DEFAULT_RC_SPEED
     dragging_speed = False
+    calibration = Calibration()
+    map_tracker = MapTracker()
+    last_frame: Optional[np.ndarray] = None
 
     def stop_app() -> None:
         nonlocal running
         running = False
 
-    buttons = build_buttons(layout, drone, stop_app)
+    def snapshot() -> None:
+        if last_frame is None:
+            logging.warning("No frame available for snapshot.")
+            return
+        images_dir = Path("camera_feed/images")
+        images_dir.mkdir(parents=True, exist_ok=True)
+        filename = images_dir / f"tello_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        if cv2.imwrite(str(filename), last_frame):
+            logging.info("Saved snapshot to %s", filename)
+        else:
+            logging.warning("Snapshot save failed.")
+
+    buttons = build_buttons(layout, drone, stop_app, snapshot)
     video_rect = pygame.Rect(
         layout.padding,
         layout.padding,
@@ -478,15 +458,12 @@ def main() -> None:
     )
     slider_rect = pygame.Rect(
         layout.padding + layout.video_size[0] + layout.button_gap,
-        layout.padding + int((layout.button_h + layout.button_gap) * 3)+10,
+        layout.padding + int((layout.button_h + layout.button_gap) * 3) + 10,
         layout.button_w - 8,
         SLIDER_HEIGHT,
     )
 
     while running:
-        # coordinates of the drone (as measured by key_presses)
-        global x,y,angle
-
         clock.tick(FPS)
         pressed = pygame.key.get_pressed()
         for event in pygame.event.get():
@@ -522,6 +499,10 @@ def main() -> None:
                     for btn in buttons:
                         if btn.key == pygame.K_q and btn.is_action:
                             btn.handle_click()
+                elif event.key == pygame.K_p:
+                    for btn in buttons:
+                        if btn.key == pygame.K_p and btn.is_action:
+                            btn.handle_click()
 
         lr, fb, ud, yv = compute_control_vector(buttons, pressed, speed_value)
         drone.send_rc_control(lr, fb, ud, yv)
@@ -534,9 +515,9 @@ def main() -> None:
         vision_detections = []
         frame = drone.read_frame()
         if frame is not None:
-            # frame = cv2.flip(frame, 1)
             if vision_module:
                 frame, vision_detections = vision_module.annotate(frame)
+            last_frame = frame.copy()
 
         screen.fill(BG_COLOR)
         pygame.draw.rect(screen, VIDEO_BG, video_rect, border_radius=12)
@@ -557,44 +538,12 @@ def main() -> None:
 
         draw_speed_slider(screen, text_font, label_font, slider_rect, speed_value)
         draw_buttons(screen, text_font, label_font, buttons, pressed)
-        
         pygame.display.flip()
 
-        # mapping roadmap view (similar to SLAM)
-        map = np.zeros((1000,1000,3))
-        global points
-        if 'points' not in globals():
-            points = [(500,500)]  # starting point in the middle of the map
-            x,y,angle = 0.0,0.0,-90.0  # initial coordinates and angle
-        # update coordinates based on key presses
-        if fb !=0:
-            x += distanceInterval * fb/abs(fb) * np.cos(np.radians(angle))
-            y += distanceInterval * fb/abs(fb) * np.sin(np.radians(angle))
-        if yv !=0:
-            angle += angleInterval * yv/abs(yv)
-            angle = angle % 360
-        
-        # convert left and right buttons to lateral movements, given the angle of where the drone points at
-        if lr !=0:
-            x += distanceInterval * lr/abs(lr) * np.cos(np.radians(angle+90))
-            y += distanceInterval * lr/abs(lr) * np.sin(np.radians(angle+90))
-        
-        # append new point to the list
-        head = (int(500 + x), int(500 + y))
-        points.append(head)
-        # draw the points on the map
+        map_tracker.update(lr, fb, yv, calibration)
+        map_frame = map_tracker.render(draw_path=drone.debug)
+        cv2.imshow("Tello Mapping", map_frame)
 
-        for point in points:
-            if drone.debug:
-                cv2.circle(map, point ,2 , (255,255,255),3)
-        cv2.circle(map, head ,3 , (0,0,255),5)
-        # add a small circle at the ciccumference to indicate the direction
-        cen = (int(head[0] + 8 * np.cos(np.radians(angle))), int(head[1] + 8 * np.sin(np.radians(angle))))
-        cv2.circle(map,cen,radius=1,color=(0,0,255),thickness=3)
-        cv2.putText(map,f"{(head[0]-500,-head[1]+500)}", (head[0]+10,head[1]+10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255),1)
-        
-        cv2.imshow("Tello Mapping",map)
-        
     drone.shutdown()
     pygame.quit()
 

@@ -28,7 +28,7 @@ class FaceDetector:
         cascade_path: Optional[Path] = None,
         border_ratio: float = 0.3,
     ):
-        default_path = Path(__file__).parent / "haarcascade_frontalface_default.xml"
+        default_path = Path(__file__).resolve().parent / "assets" / "haarcascade_frontalface_default.xml"
         self.cascade_path = cascade_path or default_path
         self.border_ratio = border_ratio
         self.cascade = cv2.CascadeClassifier(str(self.cascade_path))
@@ -82,7 +82,7 @@ class YOLOv8Detector:
         except Exception as exc:  # noqa: BLE001
             raise ImportError("ultralytics must be installed to use YOLOv8Detector") from exc
 
-        default_path = Path(__file__).parent / "yolov8m.pt"
+        default_path = Path(__file__).resolve().parent / "assets" / "yolov8m.pt"
         self.model_path = model_path or default_path
         self.device = device
         self.conf = conf

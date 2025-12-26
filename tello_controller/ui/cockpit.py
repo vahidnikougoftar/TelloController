@@ -515,6 +515,10 @@ def main() -> None:
         vision_detections = []
         frame = drone.read_frame()
         if frame is not None:
+#<<<<<<< HEAD:tello_controller/ui/cockpit.py
+#=======
+#            frame = cv2.flip(frame, 1)
+#>>>>>>> parent of cd863f7 (fixed the flipping stream issue):mapping.py
             if vision_module:
                 frame, vision_detections = vision_module.annotate(frame)
             last_frame = frame.copy()
@@ -544,6 +548,19 @@ def main() -> None:
         map_frame = map_tracker.render(draw_path=drone.debug)
         cv2.imshow("Tello Mapping", map_frame)
 
+<<<<<<< HEAD:tello_controller/ui/cockpit.py
+=======
+        for point in points:
+            if drone.debug:
+                cv2.circle(map, point ,2 , (255,255,255),3)
+        cv2.circle(map, head ,3 , (0,0,255),5)
+        # add a small circle at the ciccumference to indicate the direction
+        cen = (int(head[0] + 8 * np.cos(np.radians(angle))), int(head[1] + 8 * np.sin(np.radians(angle))))
+        cv2.circle(map,cen,radius=1,color=(0,0,255),thickness=3)
+        cv2.putText(map,f"{(head[0]-500,-head[1]+500)}", (head[0]+10,head[1]+10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255),1)
+        cv2.imshow("Tello Mapping",map)
+        
+>>>>>>> parent of cd863f7 (fixed the flipping stream issue):mapping.py
     drone.shutdown()
     pygame.quit()
 

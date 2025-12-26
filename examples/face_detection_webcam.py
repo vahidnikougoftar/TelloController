@@ -1,6 +1,11 @@
 import cv2
 
-from tello_controller.vision import FaceDetector
+# <<<<<<< HEAD:examples/face_detection_webcam.py
+#from .tello_controller.vision import FaceDetector
+#=======
+from vision import FaceDetector
+# >>>>>>> parent of cd863f7 (fixed the flipping stream issue):facedetection.py
+
 
 def main() -> None:
     cap = cv2.VideoCapture(0)
@@ -20,6 +25,7 @@ def main() -> None:
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
